@@ -1,156 +1,114 @@
-/**
- * Push prices to Reusely from a CSV and log everything to GitHub Actions.
- *
- * CSV format (no header changes, numbers only; blanks mean "skip"):
- * product_id,Brand New,Flawless,Good,Fair,Broken
- * 187569,700,680,520,420,120
- *
- * Secrets required (Settings → Secrets and variables → Actions → New repository secret):
- * - REUSELY_BASE_URL        e.g. https://api-us.reusely.com
- * - REUSELY_TENANT_ID       (string)
- * - REUSELY_SECRET_KEY      (string)
- * Optional (some tenants require it):
- * - REUSELY_API_KEY         (string)
- * Optional endpoint override:
- * - PUT_PRICE_ENDPOINT      default: /v2/admin/pricing
- *
- * How it works:
- * - Reads prices.csv from repo root
- * - For each row, builds a POST /v2/admin/pricing payload with only filled prices
- * - Logs successes & API errors
- */
+// push-prices.js
+// Reads device pricing from Google Sheets and pushes updates to Reusely API
 
 const fs = require("fs");
-const path = require("path");
+const { google } = require("googleapis");
+const fetch = require("node-fetch");
 
-// ---------- env / config ----------
-const BASE = (process.env.REUSELY_BASE_URL || "").replace(/\/+$/, "");
-const TENANT = process.env.REUSELY_TENANT_ID || "";
-const SECRET = process.env.REUSELY_SECRET_KEY || "";
-const APIKEY = process.env.REUSELY_API_KEY || ""; // optional
-const PUT_EP = process.env.PUT_PRICE_ENDPOINT || "/v2/admin/pricing";
+// ---------------- CONFIG ----------------
+const SHEET_ID = process.env.SHEET_ID;        // Google Sheet ID
+const SHEET_TAB = process.env.SHEET_TAB;      // Tab name, e.g. "Prices"
+const REUSELY_BASE_URL = process.env.REUSELY_BASE_URL;
+const REUSELY_TENANT_ID = process.env.REUSELY_TENANT_ID;
+const REUSELY_SECRET_KEY = process.env.REUSELY_SECRET_KEY;
+const REUSELY_API_KEY = process.env.REUSELY_API_KEY;
 
-if (!BASE || !TENANT || !SECRET) {
-  console.error("❌ Missing required secrets: REUSELY_BASE_URL, REUSELY_TENANT_ID, REUSELY_SECRET_KEY.");
-  process.exit(1);
-}
+// Path to service account JSON (passed via GitHub secret)
+const GOOGLE_CREDS = JSON.parse(process.env.GOOGLE_SHEETS_CREDENTIALS);
 
-// ---------- tiny CSV reader (no quotes in our numeric sheet) ----------
-function readCsv(filePath) {
-  const raw = fs.readFileSync(filePath, "utf8").trim();
-  const lines = raw.split(/\r?\n/);
-  const header = lines.shift().split(",");
-  return lines.map((ln) => {
-    const cols = ln.split(",");
-    const obj = {};
-    header.forEach((h, i) => (obj[h.trim()] = (cols[i] || "").trim()));
-    return obj;
-  });
-}
+// ---------------- AUTH ----------------
+const auth = new google.auth.GoogleAuth({
+  credentials: GOOGLE_CREDS,
+  scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+});
+const sheets = google.sheets({ version: "v4", auth });
 
-// ---------- helpers ----------
-function numOrNull(v) {
-  if (v === null || v === undefined || v === "") return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? Math.round(n) : null;
-}
-
-async function postJson(url, body, headers) {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-tenant-id": TENANT,
-      "x-secret-key": SECRET,
-      ...(APIKEY ? { "x-api-key": APIKEY } : {}),
-      ...headers,
-    },
-    body: JSON.stringify(body),
-  });
-  const text = await res.text();
-  let json;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    json = { _raw: text };
-  }
-  return { ok: res.ok, status: res.status, json };
-}
-
-// ---------- main ----------
+// ---------------- MAIN ----------------
 (async () => {
-  const csvPath = path.join(process.cwd(), "prices.csv");
-  if (!fs.existsSync(csvPath)) {
-    console.error("❌ prices.csv not found in repo root.");
+  try {
+    if (!SHEET_ID || !SHEET_TAB) {
+      throw new Error("Missing SHEET_ID or SHEET_TAB env vars");
+    }
+
+    // 1. Read rows from Google Sheets
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: SHEET_TAB,
+    });
+
+    const rows = res.data.values;
+    if (!rows || rows.length < 2) {
+      throw new Error("No rows found in sheet");
+    }
+
+    const headers = rows[0];
+    const colIndex = {};
+    headers.forEach((h, i) => (colIndex[h.trim()] = i));
+
+    // Required columns
+    ["product_id", "Condition", "ProposedPrice"].forEach((col) => {
+      if (colIndex[col] == null) {
+        throw new Error(`Missing column: ${col}`);
+      }
+    });
+
+    // 2. Loop rows and push prices
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i];
+      const productId = r[colIndex["product_id"]];
+      const condition = r[colIndex["Condition"]];
+      const price = r[colIndex["ProposedPrice"]];
+
+      if (!productId || !price) continue;
+
+      // Map conditions to Reusely labels
+      const condMap = {
+        New: "Brand New",
+        Mint: "Flawless",
+        Good: "Good",
+        Fair: "Fair",
+        Broken: "Broken",
+      };
+      const reuselyCond = condMap[condition] || condition;
+
+      const payload = {
+        product_id: Number(productId),
+        conditions: [
+          {
+            name: reuselyCond,
+            price: Math.round(Number(price)),
+            is_custom_price: 1,
+          },
+        ],
+      };
+
+      const url = `${REUSELY_BASE_URL.replace(/\/+$/, "")}/api/v2/admin/pricing`;
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": REUSELY_API_KEY,
+          "x-tenant-id": REUSELY_TENANT_ID,
+          "x-secret-key": REUSELY_SECRET_KEY,
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!resp.ok) {
+        const txt = await resp.text();
+        console.error(
+          `❌ Failed for ${productId} (${condition}): ${resp.status} ${txt}`
+        );
+      } else {
+        console.log(
+          `✅ Updated ${productId} (${condition}) => $${price}`
+        );
+      }
+    }
+
+    console.log("Done pushing prices.");
+  } catch (err) {
+    console.error("Error:", err.message);
     process.exit(1);
   }
-
-  const rows = readCsv(csvPath);
-  console.log(`📄 Loaded ${rows.length} row(s) from prices.csv`);
-
-  let posted = 0;
-  let skipped = 0;
-  let failed = 0;
-
-  for (const r of rows) {
-    const pid = (r["product_id"] || "").trim();
-    if (!pid) {
-      console.log("⏭️  Skipping row with no product_id.");
-      skipped++;
-      continue;
-    }
-
-    // Only include conditions that have a number
-    const pairs = [
-      ["Brand New", "New"],
-      ["Flawless", "Flawless"],
-      ["Good", "Good"],
-      ["Fair", "Fair"],
-      ["Broken", "Broken"],
-    ];
-
-    const conditions = [];
-    for (const [col, name] of pairs) {
-      const val = numOrNull(r[col]);
-      if (val !== null) conditions.push({ name, price: val, is_custom_price: 1 });
-    }
-
-    if (!conditions.length) {
-      console.log(`⏭️  ${pid}: no prices provided (all blank)`);
-      skipped++;
-      continue;
-    }
-
-    const payload = { product_id: Number(pid), conditions };
-    const url = `${BASE}${PUT_EP}`;
-
-    console.log(`➡️  POST ${url} :: product_id=${pid} :: ${conditions.map(c => `${c.name}=${c.price}`).join(", ")}`);
-
-    try {
-      const { ok, status, json } = await postJson(url, payload);
-      if (ok) {
-        console.log(`✅  ${pid}: updated. status=${status}`);
-        // Optional: show a short summary if present
-        if (json && json.data && Array.isArray(json.data.pricing)) {
-          const small = json.data.pricing.map(p => `${p.name}:${p.price}`).join(", ");
-          console.log(`    → pricing: ${small}`);
-        }
-        posted++;
-      } else {
-        console.log(`❌  ${pid}: failed. status=${status}`);
-        console.log(`    body: ${JSON.stringify(json).slice(0, 500)}`);
-        failed++;
-      }
-    } catch (e) {
-      console.log(`❌  ${pid}: network/error: ${String(e).slice(0, 300)}`);
-      failed++;
-    }
-  }
-
-  console.log("——— SUMMARY ———");
-  console.log(`Posted: ${posted}`);
-  console.log(`Skipped: ${skipped}`);
-  console.log(`Failed: ${failed}`);
-
-  if (failed > 0) process.exit(1);
 })();
