@@ -1,114 +1,120 @@
 // push-prices.js
-// Reads device pricing from Google Sheets and pushes updates to Reusely API
+// Reads Google Sheet "Proposals" tab and updates prices in Reusely via API
 
-const fs = require("fs");
 const { google } = require("googleapis");
 const fetch = require("node-fetch");
+const fs = require("fs");
 
-// ---------------- CONFIG ----------------
-const SHEET_ID = process.env.SHEET_ID;        // Google Sheet ID
-const SHEET_TAB = process.env.SHEET_TAB;      // Tab name, e.g. "Prices"
+// === Load credentials from secrets ===
+const SHEET_ID = process.env.SHEET_ID;
+const SHEET_TAB = process.env.SHEET_TAB || "Proposals";
+
 const REUSELY_BASE_URL = process.env.REUSELY_BASE_URL;
 const REUSELY_TENANT_ID = process.env.REUSELY_TENANT_ID;
 const REUSELY_SECRET_KEY = process.env.REUSELY_SECRET_KEY;
 const REUSELY_API_KEY = process.env.REUSELY_API_KEY;
 
-// Path to service account JSON (passed via GitHub secret)
-const GOOGLE_CREDS = JSON.parse(process.env.GOOGLE_SHEETS_CREDENTIALS);
+// Google service account JSON
+const GOOGLE_SHEETS_CREDENTIALS = JSON.parse(process.env.GOOGLE_SHEETS_CREDENTIALS);
 
-// ---------------- AUTH ----------------
-const auth = new google.auth.GoogleAuth({
-  credentials: GOOGLE_CREDS,
-  scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
-});
+// === Setup Google Sheets API client ===
+const auth = new google.auth.JWT(
+  GOOGLE_SHEETS_CREDENTIALS.client_email,
+  null,
+  GOOGLE_SHEETS_CREDENTIALS.private_key,
+  ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+);
 const sheets = google.sheets({ version: "v4", auth });
 
-// ---------------- MAIN ----------------
-(async () => {
-  try {
-    if (!SHEET_ID || !SHEET_TAB) {
-      throw new Error("Missing SHEET_ID or SHEET_TAB env vars");
-    }
+// === Push prices from Proposals tab ===
+async function pushPrices() {
+  console.log(`Reading prices from sheet: ${SHEET_ID}, tab: ${SHEET_TAB}`);
 
-    // 1. Read rows from Google Sheets
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId: SHEET_ID,
-      range: SHEET_TAB,
-    });
+  // 1. Read all rows from Proposals tab
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SHEET_ID,
+    range: SHEET_TAB,
+  });
 
-    const rows = res.data.values;
-    if (!rows || rows.length < 2) {
-      throw new Error("No rows found in sheet");
-    }
+  const rows = res.data.values;
+  if (!rows || rows.length < 2) {
+    console.log("No data in Proposals tab.");
+    return;
+  }
 
-    const headers = rows[0];
-    const colIndex = {};
-    headers.forEach((h, i) => (colIndex[h.trim()] = i));
+  const header = rows[0];
+  const colIndex = (name) => header.indexOf(name);
 
-    // Required columns
-    ["product_id", "Condition", "ProposedPrice"].forEach((col) => {
-      if (colIndex[col] == null) {
-        throw new Error(`Missing column: ${col}`);
-      }
-    });
+  const idxProduct = colIndex("product_id");
+  const idxCond = colIndex("Condition");
+  const idxProposed = colIndex("ProposedPrice");
 
-    // 2. Loop rows and push prices
-    for (let i = 1; i < rows.length; i++) {
-      const r = rows[i];
-      const productId = r[colIndex["product_id"]];
-      const condition = r[colIndex["Condition"]];
-      const price = r[colIndex["ProposedPrice"]];
+  if (idxProduct === -1 || idxCond === -1 || idxProposed === -1) {
+    throw new Error("Proposals tab missing required columns: product_id, Condition, ProposedPrice");
+  }
 
-      if (!productId || !price) continue;
+  // 2. Loop through rows
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const productId = r[idxProduct];
+    const condition = r[idxCond];
+    const proposed = r[idxProposed];
 
-      // Map conditions to Reusely labels
-      const condMap = {
-        New: "Brand New",
-        Mint: "Flawless",
-        Good: "Good",
-        Fair: "Fair",
-        Broken: "Broken",
-      };
-      const reuselyCond = condMap[condition] || condition;
+    if (!productId || !condition || !proposed) continue;
 
-      const payload = {
-        product_id: Number(productId),
-        conditions: [
-          {
-            name: reuselyCond,
-            price: Math.round(Number(price)),
-            is_custom_price: 1,
-          },
-        ],
-      };
+    const price = Number(proposed);
+    if (isNaN(price)) continue;
 
-      const url = `${REUSELY_BASE_URL.replace(/\/+$/, "")}/api/v2/admin/pricing`;
+    // Map condition names
+    const condMap = {
+      "New": "Brand New",
+      "Mint": "Flawless",
+      "Good": "Good",
+      "Fair": "Fair",
+      "Broken": "Broken",
+    };
+    const reuselyCond = condMap[condition] || condition;
+
+    // 3. Send to Reusely API
+    const payload = {
+      product_id: Number(productId),
+      conditions: [
+        {
+          name: reuselyCond,
+          price: Math.round(price),
+          is_custom_price: 1,
+        },
+      ],
+    };
+
+    const url = `${REUSELY_BASE_URL}/api/v2/admin/pricing`;
+    console.log(`→ Updating product ${productId}, ${condition} = $${price}`);
+
+    try {
       const resp = await fetch(url, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "x-api-key": REUSELY_API_KEY,
           "x-tenant-id": REUSELY_TENANT_ID,
           "x-secret-key": REUSELY_SECRET_KEY,
+          "x-api-key": REUSELY_API_KEY,
         },
         body: JSON.stringify(payload),
       });
 
       if (!resp.ok) {
-        const txt = await resp.text();
-        console.error(
-          `❌ Failed for ${productId} (${condition}): ${resp.status} ${txt}`
-        );
+        const text = await resp.text();
+        console.error(`❌ Failed for ${productId}: ${resp.status} ${text}`);
       } else {
-        console.log(
-          `✅ Updated ${productId} (${condition}) => $${price}`
-        );
+        console.log(`✅ Updated ${productId} (${condition}) -> $${price}`);
       }
+    } catch (err) {
+      console.error(`❌ Error updating ${productId}:`, err.message);
     }
-
-    console.log("Done pushing prices.");
-  } catch (err) {
-    console.error("Error:", err.message);
-    process.exit(1);
   }
-})();
+}
+
+pushPrices().catch((err) => {
+  console.error("Script failed:", err);
+  process.exit(1);
+});
