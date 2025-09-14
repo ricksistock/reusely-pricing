@@ -23,5 +23,5 @@ jobs:
           npm init -y
           npm install node-fetch@2
 
-      - name: Run script
-        run: node reusely-pricing.js
+      - name: Run push-prices.js
+        run: node push-prices.js
