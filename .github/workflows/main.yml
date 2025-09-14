@@ -1,14 +1,14 @@
+# .github/workflows/main.yml
 name: Reusely Pricing Bot
 
 on:
-  workflow_dispatch:   # allows manual runs
+  workflow_dispatch:
   schedule:
-    - cron: "0 */6 * * *"   # runs every 6 hours
+    - cron: "0 */6 * * *"
 
 jobs:
   run-script:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -21,15 +21,15 @@ jobs:
       - name: Install dependencies
         run: |
           npm init -y
-          npm install node-fetch@2
+          npm install googleapis node-fetch@2
 
       - name: Run push-prices.js
-        run: node push-prices.js
         env:
+          SHEET_ID: ${{ vars.SHEET_ID }}
+          SHEET_TAB: ${{ vars.SHEET_TAB }}
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           REUSELY_BASE_URL: ${{ secrets.REUSELY_BASE_URL }}
           REUSELY_TENANT_ID: ${{ secrets.REUSELY_TENANT_ID }}
           REUSELY_SECRET_KEY: ${{ secrets.REUSELY_SECRET_KEY }}
           REUSELY_API_KEY: ${{ secrets.REUSELY_API_KEY }}
-          GET_PRICE_BY_PRODUCTID: ${{ secrets.GET_PRICE_BY_PRODUCTID }}
-          PUT_PRICE_BY_PRODUCTID: ${{ secrets.PUT_PRICE_BY_PRODUCTID }}
-          LIST_PRODUCTS_ENDPOINT: ${{ secrets.LIST_PRODUCTS_ENDPOINT }}
+        run: node push-prices.js
