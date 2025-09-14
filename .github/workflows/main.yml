@@ -1,34 +1,31 @@
 name: Reusely Pricing Bot
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
   schedule:
-    - cron: "0 */6 * * *"  # every 6 hours
+    - cron: "0 */6 * * *"
 
 jobs:
   run-script:
     runs-on: ubuntu-latest
-
-    # >>> IMPORTANT: these come from your GitHub repo Secrets <<<
     env:
       SHEET_ID: ${{ secrets.SHEET_ID }}
       SHEET_TAB: Proposals
-      GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+      GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
       REUSELY_BASE_URL: ${{ secrets.REUSELY_BASE_URL }}
       REUSELY_API_KEY: ${{ secrets.REUSELY_API_KEY }}
       REUSELY_TENANT_ID: ${{ secrets.REUSELY_TENANT_ID }}
       REUSELY_SECRET_KEY: ${{ secrets.REUSELY_SECRET_KEY }}
-      # Optional: override endpoint path if your tenant needs a different one
-      PUT_PRICE_BY_PRODUCTID: /api/v2/admin/pricing
+      PUT_PRICE_BY_PRODUCTID: "/api/v2/admin/pricing"
 
     steps:
       - name: Checkout code
-      uses: actions/checkout@v4
+        uses: actions/checkout@v4
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: "18"
 
       - name: Install dependencies
         run: |
