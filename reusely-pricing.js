@@ -286,22 +286,50 @@ function getCurrentPriceFromCatalog_(priceLookup, model, carrier, storage, condi
 
 function getCurrentPriceViaApi_(productId){
   const base = PropertiesService.getDocumentProperties().getProperty("REUSELY_BASE_URL") || "";
-  const pathTpl = PropertiesService.getDocumentProperties().getProperty("GET_PRICE_BY_PRODUCTID") || DEFAULT_ENDPOINTS.GET_PRICE_BY_PRODUCTID;
+  const pathTpl = PropertiesService.getDocumentProperties().getProperty("GET_PRICE_BY_PRODUCTID") || "/v2/admin/products/{productId}/pricing";
   if (!base || !pathTpl) return null;
+
   const url = base.replace(/\/+$/,"") + pathTpl.replace("{productId}", encodeURIComponent(productId));
+
   const headers = {
     "Content-Type": "application/json",
-    "x-api-key": PropertiesService.getDocumentProperties().getProperty("REUSELY_API_KEY") || "",
+    // v2 docs show x-tenant-id and x-secret-key. If your tenant also uses x-api-key, keep it.
     "x-tenant-id": PropertiesService.getDocumentProperties().getProperty("REUSELY_TENANT_ID") || "",
     "x-secret-key": PropertiesService.getDocumentProperties().getProperty("REUSELY_SECRET_KEY") || "",
+    "x-api-key": PropertiesService.getDocumentProperties().getProperty("REUSELY_API_KEY") || ""
   };
-  try{
-    const resp = UrlFetchApp.fetch(url,{method:"get", headers, muteHttpExceptions:true});
-    if (resp.getResponseCode()!==200) return null;
-    const json = JSON.parse(resp.getContentText()||"{}");
-    if (!json || !json.prices) return null;
-    return json.prices; // { New, Flawless, Good, Fair, Broken }
-  }catch(e){ return null; }
+
+  try {
+    const resp = UrlFetchApp.fetch(url, { method: "get", headers, muteHttpExceptions: true });
+    if (resp.getResponseCode() !== 200) return null;
+
+    const json = JSON.parse(resp.getContentText() || "{}");
+
+    // v2 example shape:
+    // { "status_code": 200, "data": { "product_id": 187569, "pricing": [ {name:"New", price:700, ...}, ... ] } }
+    const list = (json.data && Array.isArray(json.data.pricing)) ? json.data.pricing : null;
+    if (!list) return null;
+
+    // Build { New, Flawless, Good, Fair, Broken } numeric map
+    const out = {};
+    list.forEach(p => {
+      const n = String(p && p.name || "").trim();
+      const v = Number(p && p.price);
+      if (!isNaN(v)) {
+        // Reusely uses "Brand New" / "Flawless" etc. Normalize to our keys.
+        const norm = (
+          n.toLowerCase() === "brand new" ? "New" :
+          n.toLowerCase() === "flawless"  ? "Flawless" :
+          n
+        );
+        out[norm] = v;
+      }
+    });
+    return out; // e.g. { New: 700, Flawless: 680, Good: 520, Fair: 420, Broken: 120 }
+
+  } catch (e) {
+    return null;
+  }
 }
 
 /////////////////////// PROPOSALS ///////////////////////
@@ -394,54 +422,55 @@ function buildProposals_(doApply, carriersFilter){
 
 /////////////////////// PUT PRICE (v2 /admin/pricing) ///////////////////////
 
-function putPrice_(productId, condition, price){
-  try{
+function putPrice_(productId, condition, price) {
+  try {
     const base = PropertiesService.getDocumentProperties().getProperty("REUSELY_BASE_URL") || "";
-    let path = PropertiesService.getDocumentProperties().getProperty("PUT_PRICE_BY_PRODUCTID") || DEFAULT_ENDPOINTS.PUT_PRICE_BY_PRODUCTID;
-    if (!base || !path) return { ok:false, note:"no-endpoint" };
+    const path = PropertiesService.getDocumentProperties().getProperty("PUT_PRICE_BY_PRODUCTID") || "/v2/admin/pricing";
+    if (!base || !path) return { ok: false, note: "no-endpoint" };
 
-    // final URL (no productId in path for v2)
-    const url = base.replace(/\/+$/,"") + path;
+    const url = base.replace(/\/+$/, "") + path;
 
-    // Map Swappa -> Reusely pricing condition names
-    const nameByCond = { "New":"New", "Mint":"Flawless", "Good":"Good", "Fair":"Fair", "Broken":"Broken" };
-    const condName = nameByCond[condition] || condition;
-
-    // Reusely body format:
-    // { product_id: <number|string>, conditions: [{ name: "New"|"...", price: <int> }] }
-    const payload = {
-      product_id: String(productId).trim(),
-      conditions: [{ name: condName, price: Math.round(Number(price)) }]
-    };
-
+    const tenantId = PropertiesService.getDocumentProperties().getProperty("REUSELY_TENANT_ID") || "";
     const headers = {
-      "content-type": "application/json",
-      "accept": "application/json",
-      "x-tenant-id":  PropertiesService.getDocumentProperties().getProperty("REUSELY_TENANT_ID")  || "",
+      "Content-Type": "application/json",
+      "x-api-key": PropertiesService.getDocumentProperties().getProperty("REUSELY_API_KEY") || "",
+      "x-tenant-id": tenantId,
       "x-secret-key": PropertiesService.getDocumentProperties().getProperty("REUSELY_SECRET_KEY") || "",
     };
-    const maybeApiKey = PropertiesService.getDocumentProperties().getProperty("REUSELY_API_KEY") || "";
-    if (maybeApiKey) headers["x-api-key"] = maybeApiKey;
 
-    const resp = UrlFetchApp.fetch(url,{
-      method:"post",
+    // Map Swappa -> Reusely conditions
+    const condMap = { "New": "Brand New", "Mint": "Flawless", "Good": "Good", "Fair": "Fair", "Broken": "Broken" };
+    const reuselyCond = condMap[condition] || condition;
+
+    const payload = {
+      product_id: Number(productId),
+      conditions: [
+        {
+          name: reuselyCond,
+          price: Math.round(Number(price)),
+          is_custom_price: 1
+        }
+      ]
+    };
+
+    const resp = UrlFetchApp.fetch(url, {
+      method: "post",
       headers,
+      contentType: "application/json",
       payload: JSON.stringify(payload),
-      muteHttpExceptions:true,
-      followRedirects:true,
+      muteHttpExceptions: true,
     });
 
     const code = resp.getResponseCode();
-    if (code>=200 && code<300) return { ok:true, note:"" };
+    if (code >= 200 && code < 300) return { ok: true, note: "" };
 
-    const body = String(resp.getContentText() || "").slice(0,300).replace(/\s+/g," ").trim();
-    return { ok:false, note:`${code} ${body} @ ${url}` };
+    const body = String(resp.getContentText() || "").slice(0, 300).replace(/\s+/g, " ").trim();
+    return { ok: false, note: `${code} ${body} @ ${url}` };
 
-  }catch(e){
-    return { ok:false, note:String(e && e.message ? e.message : e) };
+  } catch (e) {
+    return { ok: false, note: String(e && e.message ? e.message : e) };
   }
 }
-
 /////////////////////// REFRESH CATALOG (OPTIONAL) ///////////////////////
 
 function refreshCatalogFromApi(){
