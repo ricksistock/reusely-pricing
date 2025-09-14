@@ -4,7 +4,7 @@
  * - Matches product_id using the Reusely_Catalog tab
  * - Computes ProposedPrice via your rank rules
  * - NEW condition: always target leader - $20 if not #1
- * - Optional: Apply updates to Reusely via Public API
+ * - Optional: Apply updates to Reusely via Admin API (v2)
  * - Sequential runner (one carrier per execution) to avoid timeouts
  * - CSV exporter that mirrors Reusely_Catalog and includes ONLY changed rows
  ******************************************************/
@@ -22,7 +22,7 @@ const COL_MODEL   = "Model";
 const COL_STORAGE = "Storage";
 const CONDITIONS  = ["New", "Mint", "Good", "Fair", "Broken"];
 
-// Pricing
+// Pricing logic
 const PRICE_BUMP_ABOVE_SECOND = 1;
 const TRIM_LEAD_THRESHOLD = 5.0;
 const NEW_UNDERCUT_LEADER_BY = 20;
@@ -37,7 +37,7 @@ const PRICE_COLS_IN_CATALOG = {
   "Broken":  "Broken",
 };
 
-// Secrets
+// Secrets / endpoints to store in Document Properties
 const SECRET_KEYS = [
   "REUSELY_BASE_URL",
   "REUSELY_API_KEY",
@@ -49,13 +49,9 @@ const SECRET_KEYS = [
 ];
 
 const DEFAULT_ENDPOINTS = {
-  // leave list + GET fallback as-is for now
   LIST_PRODUCTS_ENDPOINT: "/v1/products?limit=1000",
-  GET_PRICE_BY_PRODUCTID: "/v1/products/{productId}/trade-in",
-
-  // ✅ NEW: v2 pricing endpoint (no productId in the path)
-  // Reusely docs: POST /api/v2/admin/pricing
-  PUT_PRICE_BY_PRODUCTID: "/api/v2/admin/pricing",
+  GET_PRICE_BY_PRODUCTID: "/api/v2/admin/products/{productId}/pricing", // v2 read
+  PUT_PRICE_BY_PRODUCTID: "/api/v2/admin/pricing",                       // v2 write
 };
 
 // Sequential runner state
@@ -128,7 +124,7 @@ function _norm(s){ return String(s||"").trim(); }
 function _normalizeCarrier(c){ c=(c||"").toLowerCase(); if(c.includes("unlocked"))return"Unlocked"; if(c.includes("at&t")||c.includes("att"))return"AT&T"; if(c.includes("t-mobile")||c.includes("tmobile"))return"T-Mobile"; if(c.includes("verizon"))return"Verizon"; return c; }
 function _gbNormalize(s){ s=String(s||"").toUpperCase().replace(/\s+/g,""); const m=s.match(/(\d+)\s*GB/i); return m?`${m[1]}GB`:s; }
 
-// Normalize SE naming only (leave others intact)
+// Normalize SE naming only
 function _cleanCatalogModelName_(s){
   const x=(s||"").trim().replace(/\s+/g," ");
   return x
@@ -138,7 +134,7 @@ function _cleanCatalogModelName_(s){
     .replace(/\bSE 3(.*)?\b/i,"SE (2022)");
 }
 
-// Strip carrier & size from product_name to get the model-only string.
+// Strip carrier & size from product_name to get model-only
 function _extractModelFromCatalog_(productName, networkName, sizeName){
   let s = String(productName || "");
   if (sizeName) {
@@ -285,51 +281,41 @@ function getCurrentPriceFromCatalog_(priceLookup, model, carrier, storage, condi
 }
 
 function getCurrentPriceViaApi_(productId){
-  const base = PropertiesService.getDocumentProperties().getProperty("REUSELY_BASE_URL") || "";
-  const pathTpl = PropertiesService.getDocumentProperties().getProperty("GET_PRICE_BY_PRODUCTID") || "/v2/admin/products/{productId}/pricing";
-  if (!base || !pathTpl) return null;
+  const base   = PropertiesService.getDocumentProperties().getProperty("REUSELY_BASE_URL") || "";
+  const path   = PropertiesService.getDocumentProperties().getProperty("GET_PRICE_BY_PRODUCTID")
+                 || DEFAULT_ENDPOINTS.GET_PRICE_BY_PRODUCTID;
+  if (!base || !path) return null;
 
-  const url = base.replace(/\/+$/,"") + pathTpl.replace("{productId}", encodeURIComponent(productId));
-
+  const url = base.replace(/\/+$/,"") + path.replace("{productId}", encodeURIComponent(productId));
   const headers = {
     "Content-Type": "application/json",
-    // v2 docs show x-tenant-id and x-secret-key. If your tenant also uses x-api-key, keep it.
-    "x-tenant-id": PropertiesService.getDocumentProperties().getProperty("REUSELY_TENANT_ID") || "",
+    "x-tenant-id":  PropertiesService.getDocumentProperties().getProperty("REUSELY_TENANT_ID")  || "",
     "x-secret-key": PropertiesService.getDocumentProperties().getProperty("REUSELY_SECRET_KEY") || "",
-    "x-api-key": PropertiesService.getDocumentProperties().getProperty("REUSELY_API_KEY") || ""
+    "x-api-key":    PropertiesService.getDocumentProperties().getProperty("REUSELY_API_KEY")    || "" // optional
   };
 
-  try {
-    const resp = UrlFetchApp.fetch(url, { method: "get", headers, muteHttpExceptions: true });
-    if (resp.getResponseCode() !== 200) return null;
+  try{
+    const resp = UrlFetchApp.fetch(url,{ method:"get", headers, muteHttpExceptions:true });
+    if (resp.getResponseCode()!==200) return null;
 
-    const json = JSON.parse(resp.getContentText() || "{}");
-
-    // v2 example shape:
-    // { "status_code": 200, "data": { "product_id": 187569, "pricing": [ {name:"New", price:700, ...}, ... ] } }
+    const json = JSON.parse(resp.getContentText()||"{}");
     const list = (json.data && Array.isArray(json.data.pricing)) ? json.data.pricing : null;
     if (!list) return null;
 
-    // Build { New, Flawless, Good, Fair, Broken } numeric map
+    // Normalize to { New, Flawless, Good, Fair, Broken }
     const out = {};
-    list.forEach(p => {
-      const n = String(p && p.name || "").trim();
+    list.forEach(p=>{
+      const nRaw = String(p && p.name || "").trim();
       const v = Number(p && p.price);
-      if (!isNaN(v)) {
-        // Reusely uses "Brand New" / "Flawless" etc. Normalize to our keys.
-        const norm = (
-          n.toLowerCase() === "brand new" ? "New" :
-          n.toLowerCase() === "flawless"  ? "Flawless" :
-          n
-        );
-        out[norm] = v;
-      }
+      if (isNaN(v)) return;
+      const n = (nRaw.toLowerCase()==="brand new") ? "New"
+              : (nRaw.toLowerCase()==="flawless")  ? "Flawless"
+              : nRaw;
+      out[n] = v;
     });
-    return out; // e.g. { New: 700, Flawless: 680, Good: 520, Fair: 420, Broken: 120 }
+    return out;
 
-  } catch (e) {
-    return null;
-  }
+  }catch(e){ return null; }
 }
 
 /////////////////////// PROPOSALS ///////////////////////
@@ -423,65 +409,64 @@ function buildProposals_(doApply, carriersFilter){
 /////////////////////// PUT PRICE (v2 /admin/pricing) ///////////////////////
 
 function putPrice_(productId, condition, price) {
-  try {
+  try{
     const base = PropertiesService.getDocumentProperties().getProperty("REUSELY_BASE_URL") || "";
-    const path = PropertiesService.getDocumentProperties().getProperty("PUT_PRICE_BY_PRODUCTID") || "/v2/admin/pricing";
-    if (!base || !path) return { ok: false, note: "no-endpoint" };
+    const path = PropertiesService.getDocumentProperties().getProperty("PUT_PRICE_BY_PRODUCTID")
+                || DEFAULT_ENDPOINTS.PUT_PRICE_BY_PRODUCTID;
+    if (!base || !path) return { ok:false, note:"no-endpoint" };
 
-    const url = base.replace(/\/+$/, "") + path;
+    const url = base.replace(/\/+$/,"") + path;
 
     const tenantId = PropertiesService.getDocumentProperties().getProperty("REUSELY_TENANT_ID") || "";
     const headers = {
       "Content-Type": "application/json",
-      "x-api-key": PropertiesService.getDocumentProperties().getProperty("REUSELY_API_KEY") || "",
-      "x-tenant-id": tenantId,
+      "x-api-key":    PropertiesService.getDocumentProperties().getProperty("REUSELY_API_KEY") || "",
+      "x-tenant-id":  tenantId,
       "x-secret-key": PropertiesService.getDocumentProperties().getProperty("REUSELY_SECRET_KEY") || "",
     };
 
-    // Map Swappa -> Reusely conditions
-    const condMap = { "New": "Brand New", "Mint": "Flawless", "Good": "Good", "Fair": "Fair", "Broken": "Broken" };
+    // Swappa → Reusely condition labels expected by v2 pricing
+    const condMap = { "New":"New", "Mint":"Flawless", "Good":"Good", "Fair":"Fair", "Broken":"Broken" };
     const reuselyCond = condMap[condition] || condition;
 
     const payload = {
       product_id: Number(productId),
       conditions: [
-        {
-          name: reuselyCond,
-          price: Math.round(Number(price)),
-          is_custom_price: 1
-        }
+        { name: reuselyCond, price: Math.round(Number(price)), is_custom_price: 1 }
       ]
     };
 
-    const resp = UrlFetchApp.fetch(url, {
-      method: "post",
+    const resp = UrlFetchApp.fetch(url,{
+      method:"post",
       headers,
-      contentType: "application/json",
+      contentType:"application/json",
       payload: JSON.stringify(payload),
-      muteHttpExceptions: true,
+      muteHttpExceptions:true
     });
 
     const code = resp.getResponseCode();
-    if (code >= 200 && code < 300) return { ok: true, note: "" };
+    if (code>=200 && code<300) return { ok:true, note:"" };
 
-    const body = String(resp.getContentText() || "").slice(0, 300).replace(/\s+/g, " ").trim();
-    return { ok: false, note: `${code} ${body} @ ${url}` };
+    const body = String(resp.getContentText()||"").slice(0,300).replace(/\s+/g," ").trim();
+    return { ok:false, note:`${code} ${body} @ ${url}` };
 
-  } catch (e) {
-    return { ok: false, note: String(e && e.message ? e.message : e) };
+  }catch(e){
+    return { ok:false, note:String(e && e.message ? e.message : e) };
   }
 }
+
 /////////////////////// REFRESH CATALOG (OPTIONAL) ///////////////////////
 
 function refreshCatalogFromApi(){
   const base = PropertiesService.getDocumentProperties().getProperty("REUSELY_BASE_URL") || "";
-  const path = PropertiesService.getDocumentProperties().getProperty("LIST_PRODUCTS_ENDPOINT") || DEFAULT_ENDPOINTS.LIST_PRODUCTS_ENDPOINT;
+  const path = PropertiesService.getDocumentProperties().getProperty("LIST_PRODUCTS_ENDPOINT")
+              || DEFAULT_ENDPOINTS.LIST_PRODUCTS_ENDPOINT;
   const url = base.replace(/\/+$/,"") + path;
   const headers = {
     "Content-Type":"application/json",
-    "x-api-key": PropertiesService.getDocumentProperties().getProperty("REUSELY_API_KEY") || "",
+    "x-api-key":   PropertiesService.getDocumentProperties().getProperty("REUSELY_API_KEY")   || "",
     "x-tenant-id": PropertiesService.getDocumentProperties().getProperty("REUSELY_TENANT_ID") || "",
-    "x-secret-key": PropertiesService.getDocumentProperties().getProperty("REUSELY_SECRET_KEY") || "",
+    "x-secret-key":PropertiesService.getDocumentProperties().getProperty("REUSELY_SECRET_KEY")|| "",
   };
   const resp = UrlFetchApp.fetch(url,{method:"get", headers, muteHttpExceptions:true});
   if (resp.getResponseCode()!==200){ SpreadsheetApp.getUi().alert(`Catalog fetch failed: ${resp.getResponseCode()}`); return; }
@@ -542,7 +527,7 @@ function processNextCarrier_(){
   if (!queue.length){ _cleanupSelfTriggers_("processNextCarrier_"); return; }
   const carrier = queue.shift();
   props.setProperty(QUEUE_KEY, JSON.stringify(queue));
-  buildProposals_(apply, [carriage=carrier]);
+  buildProposals_(apply, [carrier]); // fixed typo
   if (queue.length) ScriptApp.newTrigger("processNextCarrier_").timeBased().after(1500).create();
   else { _cleanupSelfTriggers_("processNextCarrier_"); SpreadsheetApp.getUi().alert(`Sequential ${apply ? "APPLY" : "DRY RUN"} finished.`); }
 }
