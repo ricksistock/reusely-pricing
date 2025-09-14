@@ -3,7 +3,7 @@ name: Reusely Pricing Bot
 on:
   workflow_dispatch:   # allows manual runs
   schedule:
-    - cron: "0 */6 * * *"   # runs every 6 hours (adjust if you want)
+    - cron: "0 */6 * * *"   # runs every 6 hours
 
 jobs:
   run-script:
@@ -25,3 +25,11 @@ jobs:
 
       - name: Run push-prices.js
         run: node push-prices.js
+        env:
+          REUSELY_BASE_URL: ${{ secrets.REUSELY_BASE_URL }}
+          REUSELY_TENANT_ID: ${{ secrets.REUSELY_TENANT_ID }}
+          REUSELY_SECRET_KEY: ${{ secrets.REUSELY_SECRET_KEY }}
+          REUSELY_API_KEY: ${{ secrets.REUSELY_API_KEY }}
+          GET_PRICE_BY_PRODUCTID: ${{ secrets.GET_PRICE_BY_PRODUCTID }}
+          PUT_PRICE_BY_PRODUCTID: ${{ secrets.PUT_PRICE_BY_PRODUCTID }}
+          LIST_PRODUCTS_ENDPOINT: ${{ secrets.LIST_PRODUCTS_ENDPOINT }}
