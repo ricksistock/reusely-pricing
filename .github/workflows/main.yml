@@ -1,0 +1,23 @@
+name: Reusely Pricing Bot
+
+on:
+  workflow_dispatch:   # lets you run it manually from GitHub
+  schedule:
+    - cron: "0 */6 * * *"   # runs every 6 hours (you can change this)
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Run script
+        run: |
+          echo "Here we’ll later run your pricing updater"
