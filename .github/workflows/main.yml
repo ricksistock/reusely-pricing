@@ -1,10 +1,9 @@
-# .github/workflows/main.yml
 name: Reusely Pricing Bot
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:        # run manually from the Actions tab
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 */6 * * *"   # runs every 6 hours (change if you like)
 
 jobs:
   run-script:
@@ -25,8 +24,8 @@ jobs:
 
       - name: Run push-prices.js
         env:
-          SHEET_ID: ${{ vars.SHEET_ID }}
-          SHEET_TAB: ${{ vars.SHEET_TAB }}
+          SHEET_ID: ${{ vars.SHEET_ID }}                       # set in Repo → Settings → Variables
+          SHEET_TAB: ${{ vars.SHEET_TAB }}                     # set to "Proposals" (or your tab name)
           GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           REUSELY_BASE_URL: ${{ secrets.REUSELY_BASE_URL }}
           REUSELY_TENANT_ID: ${{ secrets.REUSELY_TENANT_ID }}
